@@ -98,30 +98,31 @@ jobs:
           LATEST: ${{ steps.check.outputs.latest }}
           CURRENT: ${{ steps.check.outputs.current }}
           CONFLICTS: ${{ steps.merge.outputs.conflicts }}
-        run: |
-          const { LATEST, CURRENT, CONFLICTS } = process.env;
-          const conflicts = (CONFLICTS || "").trim();
-          const body = [
-            `Sync \`${CURRENT}\` → \`${LATEST}\` stopped and needs a hand.`,
-            "",
-            conflicts
-              ? `**Merge conflicts:**\n${conflicts.split("\n").map((f) => `- \`${f}\``).join("\n")}`
-              : "**The merge applied cleanly** — install, patch assertions or typecheck failed, so a patch may have gone inert. See the run log.",
-            "",
-            `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-            "",
-            "Locally:",
-            "```",
-            "git fetch upstream --tags",
-            `git checkout openbay && git merge ${LATEST}`,
-            "# resolve, then:",
-            `echo ${LATEST} > .openbay/upstream.txt && git commit -a`,
-            "bun install && bun run --cwd apps/api test -- src/lib/openbay-patches.test.ts",
-            "```",
-          ].join("\n");
-          const title = `Upstream sync ${LATEST} needs manual resolution`;
-          const existing = await github.rest.issues.listForRepo({
-            ...context.repo, state: "open", labels: "upstream-sync",
-          });
-          if (existing.data.some((i) => i.title === title)) return;
-          await github.rest.issues.create({ ...context.repo, title, body, labels: ["upstream-sync"] });
+        with:
+          script: |
+            const { LATEST, CURRENT, CONFLICTS } = process.env;
+            const conflicts = (CONFLICTS || "").trim();
+            const body = [
+              `Sync \`${CURRENT}\` → \`${LATEST}\` stopped and needs a hand.`,
+              "",
+              conflicts
+                ? `**Merge conflicts:**\n${conflicts.split("\n").map((f) => `- \`${f}\``).join("\n")}`
+                : "**The merge applied cleanly** — install, patch assertions or typecheck failed, so a patch may have gone inert. See the run log.",
+              "",
+              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              "",
+              "Locally:",
+              "```",
+              "git fetch upstream --tags",
+              `git checkout openbay && git merge ${LATEST}`,
+              "# resolve, then:",
+              `echo ${LATEST} > .openbay/upstream.txt && git commit -a`,
+              "bun install && bun run --cwd apps/api test -- src/lib/openbay-patches.test.ts",
+              "```",
+            ].join("\n");
+            const title = `Upstream sync ${LATEST} needs manual resolution`;
+            const existing = await github.rest.issues.listForRepo({
+              ...context.repo, state: "open", labels: "upstream-sync",
+            });
+            if (existing.data.some((i) => i.title === title)) return;
+            await github.rest.issues.create({ ...context.repo, title, body, labels: ["upstream-sync"] });
