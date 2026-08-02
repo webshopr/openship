@@ -28,7 +28,7 @@ export const AddDomainBody = Type.Object({
   isPrimary: Type.Optional(Type.Boolean({ default: false })),
   /** Externally-managed ingress + TLS (Cloudflare Tunnel, LB): verify via TXT
    *  only, skip certbot, serve plain HTTP. Domain need not resolve to the box. */
-  externalIngress: Type.Optional(Type.Boolean({ default: false })),
+  externalIngress: Type.Optional(Type.Boolean()),
 });
 
 /** Operator-supplied certificate (BYO / Cloudflare Origin CA) to install for a

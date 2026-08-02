@@ -279,6 +279,32 @@ const envSchema = z.object({
    * SSL is NOT auto-provisioned for these - only for custom domains.
    */
   HOST_DOMAIN: z.string().optional(),
+  /**
+   * Separator between an app's label and HOST_DOMAIN. Default "." keeps the
+   * upstream `myapp.example.com`. Use "--" when this instance sits behind a
+   * shared wildcard certificate that only covers one label — the app then lands
+   * on `myapp--acme.example.com`, which `*.example.com` does cover.
+   */
+  HOST_DOMAIN_JOINER: z
+    .string()
+    .regex(/^(\.|-{1,2})$/, 'HOST_DOMAIN_JOINER must be ".", "-" or "--"')
+    .default("."),
+  /**
+   * Takes the externalIngress choice away from the user and imposes one value.
+   *
+   * "unset" keeps upstream behaviour (per-domain choice, default false). On an
+   * instance sitting behind an operator edge that owns port 80 and terminates
+   * TLS, the choice is a trap: certbot can never answer the ACME challenge and
+   * the domain stays pending forever — so the operator pins "true" and the
+   * dashboard explains it instead of offering a toggle that breaks things.
+   */
+  EXTERNAL_INGRESS_FORCED: z.enum(["unset", "true", "false"]).default("unset"),
+  /**
+   * Who runs this instance, when it isn't the person using it. Shown in the
+   * dashboard and in the messages explaining operator-imposed settings. Empty
+   * → no operator mention anywhere (plain self-hosted install).
+   */
+  OPERATOR_NAME: z.string().default(""),
 
   /* ---------- Oblien Cloud ---------- */
   OBLIEN_CLIENT_ID: z.string().optional(),

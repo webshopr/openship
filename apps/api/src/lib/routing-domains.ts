@@ -3,6 +3,7 @@ import type { RoutedDomainInput, SslProvider, SslResult } from "@repo/adapters";
 import { SYSTEM, ConflictError, resolveServiceHostnameLabel, normalizeCustomHostname } from "@repo/core";
 import { env } from "../config/env";
 import { serviceKind } from "./deployable-service";
+import { managedHostname, managedHostnameSuffix } from "./managed-hostname";
 import { resolveServicePublicEndpoints } from "./public-endpoints";
 import { resolveSslPatch } from "./domain-ssl";
 import { generateToken } from "./domain-token";
@@ -43,7 +44,7 @@ function usesCertbotSsl(runtimeName: string): boolean {
 export function resolveManagedHostname(hostname: string): { isManaged: boolean; subdomain?: string } {
   const baseDomain = getRoutingBaseDomain().toLowerCase();
   const normalized = hostname.trim().toLowerCase();
-  const suffix = `.${baseDomain}`;
+  const suffix = managedHostnameSuffix(baseDomain);
 
   if (!normalized.endsWith(suffix)) {
     return { isManaged: false };
@@ -159,7 +160,7 @@ export function buildProjectRouteDomains(opts: {
 
       const routeSlug = endpoint.domain || managedSlug;
       if (routeSlug && usesManagedRouting) {
-        add(`${routeSlug}.${baseDomain}`, {
+        add(managedHostname(routeSlug, baseDomain), {
           domainType: "free",
           destination,
           skipSsl: true,
@@ -229,7 +230,10 @@ export function buildServiceRouteDomains(opts: {
     const hostname = endpoint.domainType === "custom"
       ? (endpoint.customDomain ? normalizeCustomHostname(endpoint.customDomain) : null)
       : usesManagedRouting
-        ? `${resolveServiceHostnameLabel(project.slug ?? project.name, service.name, endpoint.domain, serviceKind(service))}.${getRoutingBaseDomain()}`
+        ? managedHostname(
+            resolveServiceHostnameLabel(project.slug ?? project.name, service.name, endpoint.domain, serviceKind(service)),
+            getRoutingBaseDomain(),
+          )
         : null;
 
     if (!hostname) continue;

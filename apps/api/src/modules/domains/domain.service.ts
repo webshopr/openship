@@ -20,6 +20,8 @@ import { platform, assertResourceInOrg } from "../../lib/controller-helpers";
 import { buildBackgroundContext, type RequestContext } from "../../lib/request-context";
 import { manageDomainSsl, installDomainCert, provisionDomainCertForVerify, verifyExistingCert } from "../../lib/domain-ssl";
 import { getRoutingBaseDomain } from "../../lib/routing-domains";
+import { externalIngressPatch, resolveExternalIngress } from "../../lib/external-ingress";
+import { managedHostnameSuffix } from "../../lib/managed-hostname";
 import { resolveRecords } from "../../lib/dns-resolver";
 import { resolveProjectServerHost } from "../../lib/server-target";
 import { reconcileProjectRoutes } from "../../lib/route-apply.service";
@@ -81,7 +83,7 @@ export async function addDomain(ctx: RequestContext, data: TAddDomainBody) {
   // managed slug via the "add custom domain" flow and bypass the free-
   // domain slug picker.
   const baseDomain = getRoutingBaseDomain().toLowerCase();
-  if (hostname === baseDomain || hostname.endsWith(`.${baseDomain}`)) {
+  if (hostname === baseDomain || hostname.endsWith(managedHostnameSuffix(baseDomain))) {
     throw new ValidationError(
       `${baseDomain} subdomains are free managed domains — set them in the project's public endpoints, not as a custom domain.`,
     );
@@ -104,11 +106,12 @@ export async function addDomain(ctx: RequestContext, data: TAddDomainBody) {
     // still running), retrying must resume from the existing row instead of
     // trapping the user behind a same-project "already in use" conflict.
     const patch: Partial<Domain> = {};
-    if (
-      data.externalIngress !== undefined &&
-      existing.externalIngress !== data.externalIngress
-    ) {
-      patch.externalIngress = data.externalIngress;
+    const nextExternalIngress = externalIngressPatch(
+      existing.externalIngress ?? false,
+      data.externalIngress,
+    );
+    if (nextExternalIngress !== null) {
+      patch.externalIngress = nextExternalIngress;
     }
 
     if (Object.keys(patch).length > 0) {
@@ -146,7 +149,10 @@ export async function addDomain(ctx: RequestContext, data: TAddDomainBody) {
     verified: false,
     status: "pending",
     isPrimary: data.isPrimary ?? false,
-    externalIngress: data.externalIngress ?? false,
+    // Behind an operator edge that owns port 80, certbot can never win the
+    // ACME challenge — an instance in that position imposes "external" instead
+    // of leaving every custom domain stuck pending.
+    externalIngress: resolveExternalIngress(data.externalIngress),
     verificationToken: token,
   });
 
