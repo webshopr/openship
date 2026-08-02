@@ -13,6 +13,15 @@ ENV NEXT_TELEMETRY_DISABLED=1
 # build time (NEXT_PUBLIC_* is inlined) so the dashboard never calls a hardcoded
 # API host — works behind any reverse proxy / on a remote host.
 ENV NEXT_PUBLIC_API_PROXY=true
+# Operator identity, baked in for the same reason: NEXT_PUBLIC_* is inlined at
+# build time. Empty by default → the dashboard shows no operator mention at all,
+# which is what a plain self-hosted install must look like.
+ARG OPERATOR_NAME=""
+ARG OPERATOR_URL=""
+ARG EXTERNAL_INGRESS_FORCED=""
+ENV NEXT_PUBLIC_OPERATOR_NAME=$OPERATOR_NAME
+ENV NEXT_PUBLIC_OPERATOR_URL=$OPERATOR_URL
+ENV NEXT_PUBLIC_EXTERNAL_INGRESS_FORCED=$EXTERNAL_INGRESS_FORCED
 RUN bun install && cd apps/dashboard && bun run build
 
 # ─── Production stage ──────────────────────────────────

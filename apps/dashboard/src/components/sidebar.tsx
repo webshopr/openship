@@ -35,6 +35,7 @@ import { useAuth } from "@/context/AuthContext";
 import { usePlatform } from "@/context/PlatformContext";
 import { useCloud } from "@/context/CloudContext";
 import { DismissiblePopover } from "@/components/ui/Popover";
+import { OperatorBadge } from "./operator-badge";
 import { setActiveOrganizationId } from "@/lib/api/client";
 import { projectsApi } from "@/lib/api";
 import {
@@ -676,6 +677,7 @@ export function Sidebar() {
             )}
           </button>
         )}
+        <OperatorBadge collapsed={collapsed} />
       </div>
     </aside>
   );

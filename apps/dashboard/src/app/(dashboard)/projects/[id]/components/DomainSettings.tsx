@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
+import { externalIngressNotice, forcedExternalIngress } from "@/lib/operator";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -314,7 +315,7 @@ export const DomainSettings = () => {
   const [includeWww, setIncludeWww] = useState(false);
   // TLS + ingress handled upstream (Cloudflare Tunnel / LB): verify via TXT
   // only, skip certbot, serve plain HTTP. The domain need not resolve to us.
-  const [externalIngress, setExternalIngress] = useState(false);
+  const [externalIngress, setExternalIngress] = useState(forcedExternalIngress() ?? false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   // Hostname of the row currently running its Renew action. Null when no
   // renew is in flight. Per-row so multi-domain projects can renew one
@@ -715,7 +716,11 @@ export const DomainSettings = () => {
       // up front. persist (below) then attaches the port and lists it; the
       // backend keeps it pending until /verify.
       if (isCustom) {
-        const result = await projectsApi.connectDomain(id, { domain: host, includeWww, externalIngress });
+        const result = await projectsApi.connectDomain(id, {
+          domain: host,
+          includeWww,
+          ...(forcedExternalIngress() === null ? { externalIngress } : {}),
+        });
         if (!result.success) {
           showToast(
             result.error || t.projectSettings.domains.toast.addDomainFailed,
@@ -1790,7 +1795,16 @@ export const DomainSettings = () => {
                 </div>
               )}
 
-              {newDomainType === "custom" && (
+              {newDomainType === "custom" && forcedExternalIngress() !== null && (
+                <div className="rounded-xl border border-border/50 bg-muted/25 px-4 py-3">
+                  <p className="text-[13px] font-medium text-foreground">{t.projectSettings.domains.add.externalIngress}</p>
+                  <p className="text-[12px] text-muted-foreground">
+                    {externalIngressNotice(forcedExternalIngress() as boolean)}
+                  </p>
+                </div>
+              )}
+
+              {newDomainType === "custom" && forcedExternalIngress() === null && (
                 <div className="flex items-center justify-between gap-4 rounded-xl border border-border/50 bg-muted/25 px-4 py-3">
                   <div className="min-w-0">
                     <p className="text-[13px] font-medium text-foreground">{t.projectSettings.domains.add.externalIngress}</p>
