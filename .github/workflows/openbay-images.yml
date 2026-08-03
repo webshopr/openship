@@ -27,14 +27,6 @@ permissions:
   contents: read
   packages: write
 
-env:
-  # Baked into the dashboard bundle at build time (NEXT_PUBLIC_* is inlined).
-  # Empty values would produce an unbranded image — that's the upstream default,
-  # not ours.
-  OPERATOR_NAME: Openbay
-  OPERATOR_URL: https://app.openbay.dev/instances
-  EXTERNAL_INGRESS_FORCED: "true"
-
 jobs:
   # Assertions first: a patch that merged cleanly but no longer does anything
   # must stop the release here, not surface as a failing certificate later.
@@ -79,6 +71,16 @@ jobs:
     name: Build ${{ matrix.image }} (${{ matrix.platform }})
     needs: resolve-tag
     runs-on: ${{ matrix.runner }}
+    # Scoped to this job on purpose. At workflow level these also landed in the
+    # test job, where EXTERNAL_INGRESS_FORCED silently turned an "unset" default
+    # into a forced one and failed the assertions.
+    env:
+      # Baked into the dashboard bundle at build time (NEXT_PUBLIC_* is inlined).
+      # Empty values would produce an unbranded image — that's the upstream
+      # default, not ours.
+      OPERATOR_NAME: Openbay
+      OPERATOR_URL: https://app.openbay.dev/instances
+      EXTERNAL_INGRESS_FORCED: "true"
     strategy:
       fail-fast: false
       matrix:

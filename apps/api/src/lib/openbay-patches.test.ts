@@ -17,8 +17,18 @@ const BASE_ENV = {
   INTERNAL_TOKEN: "test-internal-token-0000000000000000000000000000",
 };
 
+/**
+ * Cleared before every load, so a case that passes no value asserts the DEFAULT
+ * and not whatever the runner happens to export. openbay-images.yml sets
+ * EXTERNAL_INGRESS_FORCED at workflow level for the image build args, and it
+ * reached the test job too — "leaves the choice alone when unset" then read a
+ * forced "true" and failed only in CI.
+ */
+const FORK_ENV = ["HOST_DOMAIN", "HOST_DOMAIN_JOINER", "EXTERNAL_INGRESS_FORCED", "OPERATOR_NAME"];
+
 async function load(vars: Record<string, string>) {
   vi.resetModules();
+  for (const key of FORK_ENV) vi.stubEnv(key, undefined);
   for (const [key, value] of Object.entries({ ...BASE_ENV, ...vars })) {
     vi.stubEnv(key, value);
   }
