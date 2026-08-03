@@ -28,6 +28,7 @@ import { param } from "../../lib/controller-helpers";
 import { streamSSE } from "../../lib/sse";
 import { sshManager } from "../../lib/ssh-manager";
 import { withPinnedEdgeImage } from "../../lib/edge-image";
+import { resolveAcmeProviderOptions } from "../../lib/acme-config";
 import { applyProjectRouting } from "./routing-apply.service";
 import {
   createEdgeConsentSession,
@@ -53,11 +54,10 @@ async function withEdgeExecutor<T>(
   organizationId: string,
   fn: (exec: CommandExecutor) => Promise<T>,
 ): Promise<T> {
-  const server = await repos.server.getInOrganization(serverId, organizationId).catch(() => null);
-  if (server?.isLocal) {
-    const { createHostExecutor } = await import("@repo/adapters");
-    return fn(createHostExecutor());
-  }
+  // No local/remote branch: `acquire` already returns the pooled HOST channel for a
+  // local row (and never dials its display sshHost). Branching here to a fresh
+  // `createHostExecutor()` is what leaked a connection per poll of this endpoint —
+  // the dashboard calls edgeStatus on a timer (#291).
   return sshManager.withExecutor(serverId, fn);
 }
 
@@ -207,7 +207,7 @@ export async function ensureEdgeStream(c: Context) {
         const edge = await ensureEdge(
           executor,
           (p) => installer(executor, onLog, withPinnedEdgeImage({ promptUser: p })),
-          { promptUser, onLog },
+          { promptUser, onLog, nginx: resolveAcmeProviderOptions() },
         );
         if (edge.migrated && !edge.ok) {
           throw new Error("Edge takeover failed — rolled back to the previous proxy.");

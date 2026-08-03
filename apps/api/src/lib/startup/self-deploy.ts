@@ -28,7 +28,7 @@
 
 import { repos, db, schema, eq, type Project, type Deployment } from "@repo/db";
 import { BareRuntime } from "@repo/adapters";
-import { safeErrorMessage } from "@repo/core";
+import { safeErrorMessage, UNLIMITED_RESOURCES } from "@repo/core";
 import { env } from "../../config/env";
 import { registerStartupHook } from "./index";
 import { ensureSelfEdgeInfra, type SelfEdgeOptions } from "./self-edge";
@@ -74,6 +74,7 @@ function adoptSnapshot(project: Project, dashPort: number): DeploymentConfigSnap
     buildCommand: "",
     outputDirectory: "",
     productionPaths: [],
+    volumes: [],
     rootDirectory: ".",
     port: dashPort,
     startCommand: "",
@@ -147,7 +148,11 @@ export async function ensureAdoptDeployment(
       environment: "production",
       port: dashPort,
       envVars: {},
-      resources: { cpuCores: 1, memoryMb: 512, diskMb: 1024 },
+      // No caps: this is the control plane on the operator's own host, and
+      // BareRuntime is a host process — it has no cgroup to apply them to
+      // anyway. The old hardcoded 0.5-core/512 MB literal read like a real
+      // limit on Openship itself, which it never was.
+      resources: { ...UNLIMITED_RESOURCES },
       adopt: true,
     });
     containerId = result.containerId ?? dep.id;
@@ -192,10 +197,14 @@ async function foreignProxyBlocksEdge(
   log?: (message: string, level?: "info" | "warn" | "error") => void,
 ): Promise<{ blocked: boolean; owner?: string }> {
   try {
-    const { createHostExecutor, foreignProxyOnEdge } = await import("@repo/adapters");
-    // Probe the HOST's :80/:443, not the api container's netns — createHostExecutor
-    // is LocalExecutor bare, SSH→host when containerized (OPENSHIP_HOST_SSH_*).
-    const { blocked, owner } = await foreignProxyOnEdge(createHostExecutor());
+    const { foreignProxyOnEdge } = await import("@repo/adapters");
+    const { sshManager } = await import("../ssh-manager");
+    // Probe the HOST's :80/:443, not the api container's netns — the host channel is
+    // LocalExecutor bare, SSH→host when containerized (OPENSHIP_HOST_SSH_*). Pooled,
+    // so there's nothing to dispose (see withHostExecutor).
+    const { blocked, owner } = await sshManager.withHostExecutor((exec) =>
+      foreignProxyOnEdge(exec),
+    );
     if (!blocked) return { blocked: false };
     log?.(
       `Not issuing TLS: ${owner} still owns ports 80/443, so Openship isn't the reverse proxy yet — ` +
@@ -419,9 +428,12 @@ export function registerSelfAdoptReconcile(): void {
       // left dark. Best-effort; root Linux only.
       if (isLinuxRoot()) {
         try {
-          const { createHostExecutor, recoverInterruptedTakeover } = await import("@repo/adapters");
-          // Recover takeover on the HOST (createHostExecutor: local bare, SSH→host containerized).
-          await recoverInterruptedTakeover(createHostExecutor(), (e) => console.log(`[self-deploy] ${e.message}`));
+          const { recoverInterruptedTakeover } = await import("@repo/adapters");
+          const { sshManager } = await import("../ssh-manager");
+          // Recover takeover on the HOST (local bare, SSH→host containerized).
+          await sshManager.withHostExecutor((exec) =>
+            recoverInterruptedTakeover(exec, (e) => console.log(`[self-deploy] ${e.message}`)),
+          );
         } catch {}
       }
 

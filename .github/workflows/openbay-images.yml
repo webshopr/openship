@@ -27,14 +27,6 @@ permissions:
   contents: read
   packages: write
 
-env:
-  # Baked into the dashboard bundle at build time (NEXT_PUBLIC_* is inlined).
-  # Empty values would produce an unbranded image — that's the upstream default,
-  # not ours.
-  OPERATOR_NAME: Openbay
-  OPERATOR_URL: https://app.openbay.dev/instances
-  EXTERNAL_INGRESS_FORCED: "true"
-
 jobs:
   # Assertions first: a patch that merged cleanly but no longer does anything
   # must stop the release here, not surface as a failing certificate later.
@@ -79,16 +71,31 @@ jobs:
     name: Build ${{ matrix.image }} (${{ matrix.platform }})
     needs: resolve-tag
     runs-on: ${{ matrix.runner }}
+    # Scoped to this job on purpose. At workflow level these also landed in the
+    # test job, where EXTERNAL_INGRESS_FORCED silently turned an "unset" default
+    # into a forced one and failed the assertions.
+    env:
+      # Baked into the dashboard bundle at build time (NEXT_PUBLIC_* is inlined).
+      # Empty values would produce an unbranded image — that's the upstream
+      # default, not ours.
+      OPERATOR_NAME: Openbay
+      OPERATOR_URL: https://app.openbay.dev/instances
+      EXTERNAL_INGRESS_FORCED: "true"
     strategy:
       fail-fast: false
       matrix:
         image: [api, dashboard, edge]
-        platform: [amd64, arm64]
+        # arm64 disabled: every target is x86 (OVH VPS substrate, Coolify CP), so
+        # it doubled the jobs to publish an architecture nothing pulls. To bring it
+        # back, add "arm64" below AND uncomment its runner in `include` — an
+        # include entry whose platform isn't in the list ADDS a job instead of
+        # configuring one.
+        platform: [amd64]
         include:
           - platform: amd64
             runner: ubuntu-24.04
-          - platform: arm64
-            runner: ubuntu-24.04-arm
+          # - platform: arm64
+          #   runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
         with:
@@ -103,6 +110,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Sans `image.source`, GHCR ne relie pas le package au dépôt : la page du
+      # package n'a aucun lien vers le code et sa visibilité ne se règle que dans
+      # ses propres paramètres.
+      - name: Image labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/openship-${{ matrix.image }}
+
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v6
@@ -110,6 +126,7 @@ jobs:
           context: .
           file: apps/${{ matrix.image }}/Dockerfile
           platforms: linux/${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             OPERATOR_NAME=${{ env.OPERATOR_NAME }}
             OPERATOR_URL=${{ env.OPERATOR_URL }}

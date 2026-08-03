@@ -17,14 +17,26 @@ const BASE_ENV = {
   INTERNAL_TOKEN: "test-internal-token-0000000000000000000000000000",
 };
 
+/**
+ * Cleared before every load, so a case that passes no value asserts the DEFAULT
+ * and not whatever the runner happens to export. openbay-images.yml sets
+ * EXTERNAL_INGRESS_FORCED at workflow level for the image build args, and it
+ * reached the test job too — "leaves the choice alone when unset" then read a
+ * forced "true" and failed only in CI.
+ */
+const FORK_ENV = ["HOST_DOMAIN", "HOST_DOMAIN_JOINER", "EXTERNAL_INGRESS_FORCED", "OPERATOR_NAME"];
+
 async function load(vars: Record<string, string>) {
   vi.resetModules();
+  for (const key of FORK_ENV) vi.stubEnv(key, undefined);
   for (const [key, value] of Object.entries({ ...BASE_ENV, ...vars })) {
     vi.stubEnv(key, value);
   }
   return {
     hostname: await import("./managed-hostname"),
     ingress: await import("./external-ingress"),
+    routing: await import("./routing-domains"),
+    endpoints: await import("./public-endpoints"),
   };
 }
 
@@ -48,6 +60,32 @@ describe("free managed hostname", () => {
     const { hostname } = await load({ HOST_DOMAIN_JOINER: "--" });
     const composed = hostname.managedHostname("blog", "acme.openbay.run");
     expect(composed.endsWith(hostname.managedHostnameSuffix("acme.openbay.run"))).toBe(true);
+  });
+
+  // v0.5.0 moved this composition into resolveServiceEndpointHostname and rebuilt
+  // it with a hardcoded dot, leaving the patch alive only as an unused import.
+  // Assert through the caller, not managedHostname, or the next extraction goes
+  // unnoticed again.
+  it("composes a service endpoint's free host through the joiner too", async () => {
+    const { routing } = await load({ HOST_DOMAIN_JOINER: "--", HOST_DOMAIN: "acme.openbay.run" });
+    const project = { slug: "my-app", name: "My App" } as any;
+    const service = { name: "web", kind: "compose" } as any;
+    const endpoint = { domainType: "free" as const, domain: "web" };
+
+    expect(routing.resolveServiceEndpointHostname(project, service, endpoint, true)).toBe(
+      "web--acme.openbay.run",
+    );
+  });
+
+  // public-endpoints keeps its OWN copy of the suffix. It read a dot while the
+  // rest of the codebase composed with "--", so a managed host came back
+  // unrecognised and was treated as a custom domain — routed and certbot'd as if
+  // the instance didn't own it.
+  it("recognises a joined host as managed, not as a custom domain", async () => {
+    const { endpoints } = await load({ HOST_DOMAIN_JOINER: "--", HOST_DOMAIN: "acme.openbay.run" });
+
+    expect(endpoints.managedHostnameToSlug("blog--acme.openbay.run")).toBe("blog");
+    expect(endpoints.managedHostnameToSlug("shop.example.com")).toBeUndefined();
   });
 
   it("rejects a joiner that isn't a valid hostname separator", async () => {

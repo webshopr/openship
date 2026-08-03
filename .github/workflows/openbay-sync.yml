@@ -120,9 +120,18 @@ jobs:
               "bun install && bun run --cwd apps/api test -- src/lib/openbay-patches.test.ts",
               "```",
             ].join("\n");
+            // The summary is written FIRST and unconditionally. Issues are a repo
+            // setting that can be off (they were, and a v0.5.0 sync reported nothing
+            // but a 410 in the log) — an alert must not depend on it.
+            await core.summary.addRaw(body).write();
+
             const title = `Upstream sync ${LATEST} needs manual resolution`;
-            const existing = await github.rest.issues.listForRepo({
-              ...context.repo, state: "open", labels: "upstream-sync",
-            });
-            if (existing.data.some((i) => i.title === title)) return;
-            await github.rest.issues.create({ ...context.repo, title, body, labels: ["upstream-sync"] });
+            try {
+              const existing = await github.rest.issues.listForRepo({
+                ...context.repo, state: "open", labels: "upstream-sync",
+              });
+              if (existing.data.some((i) => i.title === title)) return;
+              await github.rest.issues.create({ ...context.repo, title, body, labels: ["upstream-sync"] });
+            } catch (err) {
+              core.warning(`Could not open the tracking issue (${err.status ?? "?"}): ${err.message}. Report is in the job summary.`);
+            }

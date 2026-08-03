@@ -11,7 +11,7 @@
  * Lifecycle (up/stop/update/status) routes here when ~/.openship/install-method
  * is "compose"; otherwise the bare service backend handles it.
  */
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
@@ -29,6 +29,12 @@ import { sanitizeEdgeVhosts } from "@repo/adapters/proxy";
 import { DEFAULT_IMAGE_REGISTRY } from "@repo/core";
 
 import { OS_DIR } from "./paths";
+import {
+  DEFAULT_API_PORT,
+  DEFAULT_DASHBOARD_PORT,
+  resolvePorts,
+  type ResolvedPorts,
+} from "./ports";
 import { readSourceInstall } from "./source-install";
 
 /** Host side of the edge's routing mounts — one source of truth with the api. */
@@ -91,12 +97,72 @@ function writeInstallMethod(method: InstallMethod): void {
   writeFileSync(INSTALL_METHOD_FILE, method, { mode: 0o600 });
 }
 
-/** docker + `docker compose` both present. */
+/**
+ * Why Docker isn't usable, as three SEPARATE facts.
+ *
+ * Collapsing them into one boolean is what made the wizard announce "Docker
+ * isn't installed" on a box that had Docker but no Compose plugin (Debian's
+ * `docker.io` package ships none) — and then re-run get.docker.com for a daemon
+ * that was merely unreachable, which cannot help and rewrites the host's docker
+ * repo config on the way.
+ */
+export interface DockerState {
+  /** `docker` is on PATH. Client-only probe — never touches the socket. */
+  binary: boolean;
+  /** `docker compose` resolves (Compose v2 plugin). Also client-only. */
+  plugin: boolean;
+  /** The daemon answers US. False when it's stopped OR the socket denies this
+   *  user (not in the `docker` group) — indistinguishable from here, so the
+   *  hint below covers both. */
+  daemon: boolean;
+}
+
+export function dockerState(): DockerState {
+  const ok = (args: string[]) => spawnSync("docker", args, { stdio: "ignore" }).status === 0;
+  // `docker --version` is the client; `docker version` (no dashes) contacts the
+  // daemon and is the one that fails on a permission-denied socket.
+  if (!ok(["--version"])) return { binary: false, plugin: false, daemon: false };
+  return { binary: true, plugin: ok(["compose", "version"]), daemon: ok(["version"]) };
+}
+
+export interface DockerGap {
+  /** One line, safe to show a user verbatim. */
+  summary: string;
+  /** True when running the Docker installer would actually close this gap. */
+  installable: boolean;
+  /** What the operator should do when we can't. */
+  hint?: string;
+}
+
+/** null when Docker is fully usable. */
+export function dockerGap(state: DockerState = dockerState()): DockerGap | null {
+  if (!state.binary) {
+    return { summary: "Docker isn't installed", installable: true };
+  }
+  if (!state.plugin) {
+    return {
+      summary: "Docker is installed but the Compose plugin (`docker compose`) is missing",
+      installable: true,
+    };
+  }
+  if (!state.daemon) {
+    const asRoot = typeof process.getuid === "function" && process.getuid() === 0;
+    return {
+      summary: "Docker is installed but its daemon isn't reachable",
+      // Reinstalling changes nothing: a group change only applies to NEW logins,
+      // and a stopped daemon needs starting, not installing.
+      installable: false,
+      hint: asRoot
+        ? "Start it with: systemctl start docker"
+        : `Add your user to the docker group: sudo usermod -aG docker ${userInfo().username} — then log out and back in (or run: newgrp docker). If the daemon is stopped: sudo systemctl start docker`,
+    };
+  }
+  return null;
+}
+
+/** docker + `docker compose` present AND the daemon reachable. */
 export function hasDockerCompose(): boolean {
-  const docker = spawnSync("docker", ["version"], { stdio: "ignore" });
-  if (docker.status !== 0) return false;
-  const compose = spawnSync("docker", ["compose", "version"], { stdio: "ignore" });
-  return compose.status === 0;
+  return dockerGap() === null;
 }
 
 /**
@@ -129,9 +195,25 @@ function shQuote(s: string): string {
  * false and the caller falls back to the bare service. The installer's own
  * output is inherited (that's the real progress the operator sees).
  */
-export async function ensureDocker(): Promise<boolean> {
-  if (hasDockerCompose()) return true;
+export interface EnsureDockerOpts {
+  /** Where narration goes. Defaults to stderr; the wizard passes clack's log so
+   *  the lines match the rest of its output. */
+  onNotice?: (line: string) => void;
+}
+
+export async function ensureDocker(opts: EnsureDockerOpts = {}): Promise<boolean> {
+  const notice = opts.onNotice ?? ((line: string) => process.stderr.write(`  ${line}\n`));
+  const state = dockerState();
+  const gap = dockerGap(state);
+  if (!gap) return true;
   if (process.platform !== "linux") return false;
+  // An unreachable daemon is not an installation problem — say what to do and
+  // stop, rather than running the Docker installer over a working install.
+  if (!gap.installable) {
+    notice(gap.summary + ".");
+    if (gap.hint) notice(gap.hint);
+    return false;
+  }
 
   const plan = systemCatalog.installs.docker({
     os: "linux",
@@ -141,15 +223,52 @@ export async function ensureDocker(): Promise<boolean> {
 
   const asRoot = typeof process.getuid === "function" && process.getuid() === 0;
   const sudo = !asRoot && hasCmd("sudo") ? "sudo " : "";
-  const sh = (script: string): number =>
-    spawnSync("sh", ["-c", sudo ? `${sudo}sh -c ${shQuote(script)}` : script], {
-      stdio: "inherit",
-    }).status ?? 1;
 
-  if (sh(plan.installCommand) !== 0) return false;
+  // Set expectations BEFORE the child takes over the terminal. get.docker.com
+  // prints its commit line and then goes quiet for minutes while apt fetches
+  // ~150 MB — on a small VPS that silence reads as a hang, and operators kill it.
+  notice("This can take 2-5 minutes on a small VPS (~150 MB of packages) and stays quiet while apt works.");
+  if (state.binary) {
+    // The installer detects the existing docker, prints a scary-looking warning
+    // and then `sleep 20` before continuing. Pre-empt it or the pause looks broken.
+    notice("Docker's installer will warn that docker already exists and pause ~20s before continuing — that's expected.");
+  }
+
+  const sh = (script: string): Promise<number> =>
+    new Promise((resolve) => {
+      const child = spawn("sh", ["-c", sudo ? `${sudo}sh -c ${shQuote(script)}` : script], {
+        stdio: "inherit",
+      });
+      // Heartbeat: the ONLY output during the long apt phase, so an operator can
+      // tell "still working" from "wedged". spawn (not spawnSync) purely so this
+      // timer can fire — a sync child blocks the event loop and prints nothing.
+      const started = Date.now();
+      const tick = setInterval(() => {
+        const s = Math.round((Date.now() - started) / 1000);
+        notice(`still installing Docker — ${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s elapsed…`);
+      }, 30_000);
+      const done = (code: number) => {
+        clearInterval(tick);
+        resolve(code);
+      };
+      child.on("error", () => done(1));
+      child.on("close", (code) => done(code ?? 1));
+    });
+
+  if ((await sh(plan.installCommand)) !== 0) return false;
   // Best-effort daemon start (get.docker.com already enables it on systemd).
-  if (plan.startCommand) sh(plan.startCommand);
-  return hasDockerCompose();
+  if (plan.startCommand) await sh(plan.startCommand);
+
+  const after = dockerGap();
+  if (!after) {
+    notice("Docker ready.");
+    return true;
+  }
+  // Installed fine, still not usable — almost always the group: root installed
+  // it, this (non-root) process still can't open the socket until a new login.
+  notice(after.summary + ".");
+  if (after.hint) notice(after.hint);
+  return false;
 }
 
 export interface ComposeUpOpts {
@@ -181,6 +300,12 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
+      # Keep the data dir in a subdirectory of the volume so a fresh install never
+      # runs initdb against a bare mount root (which fails on quirky host
+      # filesystems with EPERM — #350). OPENSHIP_PGDATA is decided ONCE at install
+      # by the CLI (fresh → subdir, pre-existing volume → root) and preserved in
+      # .env, so this never moves an existing database.
+      PGDATA: \${OPENSHIP_PGDATA:-/var/lib/postgresql/data/pgdata}
       POSTGRES_USER: \${POSTGRES_USER:-openship}
       POSTGRES_PASSWORD: \${POSTGRES_PASSWORD:?missing from .env — re-run openship up to regenerate it}
       POSTGRES_DB: \${POSTGRES_DB:-openship}
@@ -424,6 +549,25 @@ function provisionHostSshChannel(): { user: string; keyPath: string } | null {
 function composeProjectName(prev: Record<string, string>): string {
   if (prev.COMPOSE_PROJECT_NAME) return prev.COMPOSE_PROJECT_NAME;
   return Object.keys(prev).length > 0 ? "compose" : "openship";
+}
+
+/**
+ * Where Postgres keeps its data directory INSIDE the `postgres_data` volume.
+ *
+ * A fresh install uses a subdirectory (`…/data/pgdata`) rather than the bare
+ * mount root: initdb against a mount root fails on quirky host filesystems with
+ * "Operation not permitted" (WAL preallocation / lost+found — see #350). But a
+ * pre-existing install already has its DB at the mount ROOT, and moving PGDATA
+ * would make Postgres init a fresh empty DB and orphan the old one. So the
+ * decision is made ONCE and then pinned in `.env` (same sticky rule as
+ * COMPOSE_PROJECT_NAME): re-runs reuse it; a volume that predates this pin keeps
+ * the root. The check uses the resolved project name so it inspects the right
+ * `<project>_postgres_data` volume.
+ */
+const PGDATA_ROOT = "/var/lib/postgresql/data";
+function resolvePgData(prev: Record<string, string>): string {
+  if (prev.OPENSHIP_PGDATA) return prev.OPENSHIP_PGDATA; // decided already — never move it
+  return dbVolumeExists(composeProjectName(prev)) ? PGDATA_ROOT : `${PGDATA_ROOT}/pgdata`;
 }
 
 /**
@@ -678,6 +822,26 @@ function keepConfig(
   return carried || undefined;
 }
 
+const ACME_ENV_KEYS = [
+  "OPENSHIP_ACME_EMAIL",
+  "OPENSHIP_ACME_DIRECTORY_URL",
+  "OPENSHIP_ACME_EAB_KID",
+  "OPENSHIP_ACME_EAB_HMAC_KEY",
+  "OPENSHIP_ACME_KEY_TYPE",
+  "OPENSHIP_ACME_CA_BUNDLE",
+  "OPENSHIP_ACME_TOS_AGREED",
+] as const;
+
+/** Preserve operator-owned ACME settings, with the current shell overriding .env. */
+function renderAcmeEnv(prev: Record<string, string>): string[] {
+  return ACME_ENV_KEYS.flatMap((key) => {
+    const value = process.env[key]?.trim() || prev[key]?.trim();
+    if (!value) return [];
+    if (/[\r\n]/.test(value)) throw new Error(`${key} must be a single-line value`);
+    return [`${key}=${value}`];
+  });
+}
+
 /** The effective config for this run: flags over previous `.env` over defaults. */
 export function resolveEnvConfig(
   prev: Record<string, string>,
@@ -685,6 +849,8 @@ export function resolveEnvConfig(
 ): {
   apiPort: string;
   dashPort: string;
+  /** Interface the api + dashboard ports are published on; undefined = all. */
+  bindAddr?: string;
   publicUrl?: string;
   trustProxy: boolean;
   extraTrustedOrigins?: string;
@@ -692,9 +858,14 @@ export function resolveEnvConfig(
   hostControl: boolean;
 } {
   const publicUrl = keepConfig(prev, "OPENSHIP_PUBLIC_URL", opts.publicUrl);
+  // Carried, not defaulted: an operator who pinned the stack to one interface has
+  // made a security decision, and regenerating `.env` without it silently
+  // republishes the api + dashboard on every interface of the box.
+  const bindAddr = keepConfig(prev, "OPENSHIP_BIND_ADDR");
   return {
-    apiPort: keepConfig(prev, "API_PORT", opts.apiPort) ?? "4000",
-    dashPort: keepConfig(prev, "DASHBOARD_PORT", opts.dashboardPort) ?? "3001",
+    apiPort: keepConfig(prev, "API_PORT", opts.apiPort) ?? String(DEFAULT_API_PORT),
+    dashPort: keepConfig(prev, "DASHBOARD_PORT", opts.dashboardPort) ?? String(DEFAULT_DASHBOARD_PORT),
+    ...(bindAddr ? { bindAddr } : {}),
     ...(publicUrl ? { publicUrl } : {}),
     // A public URL always implies a proxy in front; otherwise keep whatever the
     // install was configured with.
@@ -716,6 +887,84 @@ export function resolveEnvConfig(
   };
 }
 
+/** A usable TCP port, or undefined for anything that isn't one. */
+function toPort(value?: string): number | undefined {
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 && n <= 65535 ? n : undefined;
+}
+
+/** The ports the live install is configured with (its `.env`), if any. */
+export function composeEnvPorts(): { api?: number; dashboard?: number } {
+  const env = readEnvFile();
+  return { api: toPort(env.API_PORT), dashboard: toPort(env.DASHBOARD_PORT) };
+}
+
+/** The interface the stack publishes the api + dashboard on (compose default). */
+export function composeBindAddr(): string {
+  return readEnvFile().OPENSHIP_BIND_ADDR?.trim() || "0.0.0.0";
+}
+
+/**
+ * The trusted-origin URLs this install is configured with, so a caller can check
+ * them against a port that just moved (see `stalePortOrigins`).
+ */
+export function composeTrustedOriginUrls(): string[] {
+  const env = readEnvFile();
+  return [env.OPENSHIP_PUBLIC_URL, env.OPENSHIP_EXTRA_TRUSTED_ORIGINS].filter(
+    (v): v is string => !!v?.trim(),
+  );
+}
+
+/**
+ * Host ports currently published by containers belonging to THIS stack — the ones
+ * a port probe would call occupied even though this command is what frees them.
+ *
+ * Matched on the compose config-file label rather than the project name, so it
+ * covers both our own project and an ORPHANED one (a stack from a renamed
+ * project, which `removeOrphanedStack` force-removes before `up` binds). Running
+ * containers only: a stopped one holds nothing.
+ */
+export function composeHeldPorts(): number[] {
+  const r = spawnSync(
+    "docker",
+    ["ps", "--format", '{{.Label "com.docker.compose.project.config_files"}}\t{{.Ports}}'],
+    { encoding: "utf8" },
+  );
+  if (r.status !== 0 || !r.stdout) return [];
+  const ports = new Set<number>();
+  for (const line of r.stdout.split("\n")) {
+    const [configFiles = "", published = ""] = line.split("\t");
+    if (!configFiles.split(",").some((f) => f.trim() === COMPOSE_FILE)) continue;
+    // "0.0.0.0:4000->4000/tcp, [::]:4000->4000/tcp" — the host side is what binds.
+    for (const m of published.matchAll(/:(\d+)->/g)) ports.add(Number(m[1]));
+  }
+  return [...ports];
+}
+
+/**
+ * Resolve the stack's host ports before `.env` is written — the compose
+ * counterpart of what the bare installer does with `resolvePorts`.
+ *
+ * `docker compose up` publishes API_PORT/DASHBOARD_PORT on the host, so an
+ * occupied 4000/3001 is not a degraded install, it is a hard `bind: address
+ * already in use` that takes the whole stack down with it. Probing on the
+ * publish interface (0.0.0.0) and treating our own containers' ports as
+ * reclaimable makes a busy box behave like the desktop app: pick another port and
+ * carry on, while a plain re-run keeps the ports the install already uses.
+ */
+export async function resolveComposePorts(prefs: {
+  api?: string;
+  dashboard?: string;
+}): Promise<ResolvedPorts> {
+  return resolvePorts({
+    api: toPort(prefs.api),
+    dashboard: toPort(prefs.dashboard),
+    previous: composeEnvPorts(),
+    bindAddr: composeBindAddr(),
+    reclaimable: composeHeldPorts(),
+  });
+}
+
 function renderEnv(
   opts: ComposeUpOpts,
   host: { user: string; keyPath: string } | null,
@@ -735,11 +984,22 @@ function renderEnv(
     `OPENSHIP_IMAGE_REGISTRY=${cfg.registry}`,
     `OPENSHIP_VERSION=${opts.version || (typeof __CLI_VERSION__ === "string" ? __CLI_VERSION__ : "latest")}`,
     `POSTGRES_PASSWORD=${keepSecret(prev, "POSTGRES_PASSWORD")}`,
+    // Pinned once (see resolvePgData): fresh install → subdir, existing volume → root.
+    `OPENSHIP_PGDATA=${resolvePgData(prev)}`,
     `BETTER_AUTH_SECRET=${keepSecret(prev, "BETTER_AUTH_SECRET")}`,
     `INTERNAL_TOKEN=${keepSecret(prev, "INTERNAL_TOKEN")}`,
     `API_PORT=${cfg.apiPort}`,
     `DASHBOARD_PORT=${cfg.dashPort}`,
+    // The api's OWN view of the dashboard port: the self-app boot reconcile points
+    // the operator's domain at the dashboard through this (self-deploy.ts), and it
+    // silently defaults to 3001 when unset. Ports are dynamic now, so leaving it
+    // out publishes a domain routed to a port nothing is listening on.
+    `OPENSHIP_DASHBOARD_PORT=${cfg.dashPort}`,
+    // Alternate CA/EAB values are operator configuration (including one secret),
+    // so a routine `openship up`/upgrade must not silently discard them.
+    ...renderAcmeEnv(prev),
   ];
+  if (cfg.bindAddr) lines.push(`OPENSHIP_BIND_ADDR=${cfg.bindAddr}`);
   // The origin allowlist. Losing either of these is the ORIGIN_REJECTED failure
   // described on keepConfig — they are written whenever they are known, never
   // conditionally on this run having been given a flag.

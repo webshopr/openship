@@ -317,6 +317,140 @@ Goal: mail ships as **server image + admin image**, administrable on its own.
 
 ---
 
+## Migrate / edge
+
+### Adopted static roots need an explicit decision step in the CLI
+
+**Shipped:** `unreachableStaticRoots()`
+(`packages/adapters/src/system/proxy/import/index.ts`) reports adopted `static`
+sites whose docroot sits outside `EDGE_CONTAINER_MOUNTS` — i.e. the paths the
+containerized edge cannot read.
+
+**Not shipped:** anything that acts on it. Found on a live 15-site migration: two
+sites (`root /home/App.Front/dist/site/browser`) came up **500** —
+`rewrite or internal redirection cycle while internally redirecting to
+"/index.html"`, because `try_files` can't find an index in a directory that isn't
+mounted. Nothing warned; the operator saw two broken sites and no reason.
+
+- [ ] Migrate wizard: after the scan, if `unreachableStaticRoots()` is non-empty,
+      show the paths and make the operator choose per site (or once for all):
+      **copy** the tree under `/opt/openship/static` (already mounted — works
+      immediately, but a snapshot: rebuilding the frontend needs a re-copy),
+      **mount** the host path into the edge (correct long-term; costs an edge
+      recreate, which blips every site on the box), or **leave** it with the 500
+      spelled out. Same shape as the existing "N config items won't migrate"
+      block, but a decision rather than a warning.
+- [ ] Whichever action runs must rewrite the route's `staticRoot` (and the
+      `<slug>.route.json` beside the vhost — `provisionCert` replays it after every
+      renewal, so a root fixed only in the `.conf` reverts on renew).
+- [ ] The mount path needs a way to add a bind mount without hand-editing
+      `docker-compose.yml` — the edge is the one container whose mounts depend on
+      what the box was serving before us.
+
+### SSL provisioning is invisible in the deploy log
+
+A new project's route is registered with `tls: true`, but the 443 block is only
+emitted once the cert exists (`packages/adapters/src/infra/nginx.ts:594`
+`route.tls && certsExist(domain)`), so there is a ~1 minute window where the site
+answers HTTP and nothing on HTTPS. Verified end-to-end on a live box: cert written
+`01:00:13.137`, vhost re-rendered with TLS `01:00:13.661`, `https=200` right after
+— the pipeline is correct, but during the gap it is indistinguishable from broken,
+and two people have now reported it as an SSL bug.
+
+- [ ] Log it: "route live on HTTP — provisioning the certificate, HTTPS in ~1 min"
+      at registration, then a line when the cert lands (or fails). Issuance is
+      best-effort by design ("domains never fail a deploy"), which is exactly why
+      the *silence* has to go.
+
+---
+
+## Runtime roles: release phase, queue workers, scheduler (#231)
+
+An app stack declares exactly ONE `defaultStartCommand`
+(`packages/core/src/stacks.ts` `StackDefinition`), so a framework whose production
+shape is several processes can't express it. Laravel is the clearest case — web +
+`queue:work` + `schedule:run` — and the same shape appears in Rails
+(Sidekiq/Solid Queue + cron) and Django (Celery worker + beat).
+
+**What landed** (from #231, so the gap below is narrower than the issue describes):
+the PHP recipe now runs on FrankenPHP, which supervises correctly and propagates
+`SIGTERM` (`packages/adapters/src/runtime/docker-build-plan.ts`
+`generatePhpDockerfile`) — a worker can now be added without inheriting the old
+"container stop kills the job mid-flight" problem. Persistence, PHP extensions and
+the JS asset stage also landed; the storage section below has what's left of those.
+
+### A generic release phase
+
+Commands that run ONCE per deploy, after build and before cutover, failing the
+deploy on error. `queue:work`, `schedule:run`, `migrate --force`, `optimize` and
+`storage:link` appear nowhere in the tree today, so migrations, scheduled tasks
+and queued jobs silently never run.
+
+- [ ] Add release commands to the project + `openship.json`, snapshot them onto
+      the deployment, and run them from the deploy pipeline between build and
+      activate (`apps/api/src/modules/deployments/build-pipeline.ts` — the same
+      seam `deployConfig` is assembled in).
+- [ ] Laravel's set for 13.x: `migrate --force`, `optimize` (config/events/routes/
+      views), `storage:link`, and `reload` (13's umbrella for cycling long-running
+      services — supersedes `queue:restart` for deploys, also covers Reverb and
+      Octane).
+- [ ] Not the same thing as `#206` deploy hooks: those are an inbound trigger that
+      STARTS a deploy; this runs DURING one.
+- [ ] Until this exists, a stock SQLite Laravel app still needs its migrations run
+      by hand (the service terminal can do it) — a persistent volume stops data
+      LOSS, it doesn't bootstrap a schema.
+
+### Multi-role stacks
+
+- [ ] Decide the shape: roles declared in `StackDefinition` (worker + scheduler
+      exist automatically on detection, preserving zero-config, at the cost of a
+      real runtime-model change that has to compose with multi-node plans) vs.
+      keeping apps single-process and pushing extras to `--type services`.
+- [ ] Whichever way it goes, ANSWER IT in the docs. Auto-detection currently reads
+      as "Laravel supported" while quietly omitting queues and scheduling, and
+      that's the part the issue is actually complaining about.
+- [ ] Cheap intermediate available today: an app project can already gain a
+      second source-built unit (a `monorepo`-kind service row carries its own
+      `startCommand`), and the #231 materialization keeps the web app in the
+      fan-out. A "add a worker" button could write exactly that row.
+- [ ] `laravel` and `symfony` (`stacks.ts`) still differ only in `name` +
+      `detection`. That's correct while the recipe is generic PHP; it stops being
+      correct the moment roles are per-framework.
+
+---
+
+## Persistent storage — remaining gaps (#231, #163, #188)
+
+Volumes for single apps shipped (`packages/core/src/volumes.ts`,
+`project.volumes`, Docker `Binds` + bare `shared/` symlinks + a cloud warn), and
+object storage bindings shipped (`apps/api/src/modules/projects/project-storage.service.ts`).
+What's left:
+
+- [ ] **Backups don't cover a single app's volumes.** The backup subsystem targets
+      `service` rows (`apps/api/src/modules/backups/`), so a single-app project
+      with a `storage` volume has no policy that can back it up. The container's
+      mounts ARE discoverable (`backup/executors/docker.ts` reads them off the
+      container), so this is a targeting gap, not a capability gap.
+- [ ] **Cloud has no volume primitive.** `CloudRuntime.deploy` warns and drops a
+      declared mount. Either give Oblien workspaces a durable attach or make the
+      UI refuse the field on a cloud target instead of warning at deploy time.
+- [ ] **#163 multi-node volumes.** A stack- or project-declared path assumes the
+      workload lands on the same host next time. Settle the multi-node story
+      before any scheduler can move a container between boxes.
+- [ ] **Non-root for the other stacks.** Only the PHP recipe drops root
+      (`USER www-data`). Node/Python/Ruby/JVM/static images still run as root, each
+      with its own writable-path assumptions (npm cache, `.next`, `__pycache__`,
+      nginx temp dirs) — do them one stack at a time, not in one sweep.
+- [ ] **A default healthcheck.** Laravel ships `/up` (configurable in
+      `bootstrap/app.php`), which makes a real container healthcheck nearly free
+      for that stack; compose services already support `advanced.healthcheck`.
+- [ ] **Bare PHP is not supported.** The PHP start command assumes the frankenphp
+      binary, and the toolchain catalog has no php/composer installer
+      (`packages/adapters/src/system/modules/catalog-embedded.ts`), so PHP is
+      docker-only. Fine, but say so if a user picks bare.
+
+---
+
 ## Open TODO markers in code
 
 Verified present; listed so they aren't lost.
