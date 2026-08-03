@@ -36,6 +36,7 @@ async function load(vars: Record<string, string>) {
     hostname: await import("./managed-hostname"),
     ingress: await import("./external-ingress"),
     routing: await import("./routing-domains"),
+    endpoints: await import("./public-endpoints"),
   };
 }
 
@@ -74,6 +75,17 @@ describe("free managed hostname", () => {
     expect(routing.resolveServiceEndpointHostname(project, service, endpoint, true)).toBe(
       "web--acme.openbay.run",
     );
+  });
+
+  // public-endpoints keeps its OWN copy of the suffix. It read a dot while the
+  // rest of the codebase composed with "--", so a managed host came back
+  // unrecognised and was treated as a custom domain — routed and certbot'd as if
+  // the instance didn't own it.
+  it("recognises a joined host as managed, not as a custom domain", async () => {
+    const { endpoints } = await load({ HOST_DOMAIN_JOINER: "--", HOST_DOMAIN: "acme.openbay.run" });
+
+    expect(endpoints.managedHostnameToSlug("blog--acme.openbay.run")).toBe("blog");
+    expect(endpoints.managedHostnameToSlug("shop.example.com")).toBeUndefined();
   });
 
   it("rejects a joiner that isn't a valid hostname separator", async () => {

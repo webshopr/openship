@@ -1,6 +1,7 @@
 import type { Domain, Project, Service } from "@repo/db";
 import { SYSTEM, resolveServiceHostnameLabel, resolveRedirectStatus } from "@repo/core";
 import { getRoutingBaseDomain } from "./routing-domains";
+import { managedHostnameSuffix as joinedSuffix } from "./managed-hostname";
 import { resolveServicePort, serviceKind } from "./deployable-service";
 import { env } from "../config/env";
 
@@ -120,8 +121,13 @@ function normalizeRedirectFields(
   return { redirectTo: target, redirectStatus: resolveRedirectStatus(raw) };
 }
 
+// Second copy of the managed suffix, kept local so this leaf module stays cheap
+// to import. It has to go through the joiner like the one in routing-domains:
+// with HOST_DOMAIN_JOINER="--", a dot here fails to match `blog--acme.example.com`,
+// and every managed host is classified custom — routed and certbot'd as if the
+// instance didn't own it.
 function managedHostnameSuffix(): string {
-  return `.${getRoutingBaseDomain().trim().toLowerCase()}`;
+  return joinedSuffix(getRoutingBaseDomain().trim().toLowerCase());
 }
 
 export function managedHostnameToSlug(hostname: string): string | undefined {

@@ -64,8 +64,10 @@ These are the call sites — the only places a merge can conflict.
 | `apps/dashboard/src/components/sidebar.tsx` | operator badge |
 | `apps/dashboard/.../components/DomainSettings.tsx` | notice instead of a toggle when the value is imposed |
 
-## Known gap
+## Second suffix copy
 
 `apps/api/src/lib/public-endpoints.ts` keeps its own private copy of the managed-host
-suffix with a hardcoded dot. With a `--` joiner it classifies a managed host as a custom
-one. Predates the patches and is not covered by the guard test.
+suffix (it stays a cheap leaf import). It composes through the joiner like the one in
+`routing-domains.ts`, and a guard test covers it — with a hardcoded dot it classified
+every managed host as a custom domain, routing and certbot'ing hosts the instance
+already owns.
