@@ -85,12 +85,17 @@ jobs:
       fail-fast: false
       matrix:
         image: [api, dashboard, edge]
-        platform: [amd64, arm64]
+        # arm64 disabled: every target is x86 (OVH VPS substrate, Coolify CP), so
+        # it doubled the jobs to publish an architecture nothing pulls. To bring it
+        # back, add "arm64" below AND uncomment its runner in `include` — an
+        # include entry whose platform isn't in the list ADDS a job instead of
+        # configuring one.
+        platform: [amd64]
         include:
           - platform: amd64
             runner: ubuntu-24.04
-          - platform: arm64
-            runner: ubuntu-24.04-arm
+          # - platform: arm64
+          #   runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
         with:
