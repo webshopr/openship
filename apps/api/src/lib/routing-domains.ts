@@ -3,6 +3,7 @@ import type { RoutedDomainInput, SslProvider, SslResult } from "@repo/adapters";
 import { SYSTEM, ConflictError, resolveServiceHostnameLabel, normalizeCustomHostname, safeErrorMessage } from "@repo/core";
 import { env } from "../config/env";
 import { serviceKind } from "./deployable-service";
+import { managedHostname, managedHostnameSuffix } from "./managed-hostname";
 import { resolveServicePublicEndpoints, type StoredPublicEndpoint } from "./public-endpoints";
 import { acmeIssueLockKey, LOCAL_ACME_SCOPE, resolveSslPatch, sslIssueLockKey } from "./domain-ssl";
 import { resolveRouteRedirect } from "./domain-redirect";
@@ -65,7 +66,7 @@ function usesCertbotSsl(runtimeName: string): boolean {
 export function resolveManagedHostname(hostname: string): { isManaged: boolean; subdomain?: string } {
   const baseDomain = getRoutingBaseDomain().toLowerCase();
   const normalized = hostname.trim().toLowerCase();
-  const suffix = `.${baseDomain}`;
+  const suffix = managedHostnameSuffix(baseDomain);
 
   if (!normalized.endsWith(suffix)) {
     return { isManaged: false };
@@ -289,7 +290,7 @@ export function buildProjectRouteDomains(opts: {
 
       const routeSlug = endpoint.domain || managedSlug;
       if (routeSlug && usesManagedRouting) {
-        add(`${routeSlug}.${baseDomain}`, {
+        add(managedHostname(routeSlug, baseDomain), {
           domainType: "free",
           destination,
           skipSsl: true,
@@ -365,7 +366,7 @@ export function resolveServiceEndpointHostname(
     endpoint.domain,
     serviceKind(service),
   );
-  return `${label}.${getRoutingBaseDomain()}`;
+  return managedHostname(label, getRoutingBaseDomain());
 }
 
 export function buildServiceRouteDomains(opts: {

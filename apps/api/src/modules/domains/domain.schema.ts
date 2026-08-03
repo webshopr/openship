@@ -28,7 +28,10 @@ export const AddDomainBody = Type.Object({
   isPrimary: Type.Optional(Type.Boolean({ default: false })),
   /** Externally-managed ingress + TLS (Cloudflare Tunnel, LB): verify via TXT
    *  only, skip certbot, serve plain HTTP. Domain need not resolve to the box. */
-  externalIngress: Type.Optional(Type.Boolean({ default: false })),
+  // No `default: false` here (upstream sets one): the value must reach addDomain
+  // undefined, or resolveExternalIngress can't tell "unspecified" from an explicit
+  // false and EXTERNAL_INGRESS_FORCED never applies.
+  externalIngress: Type.Optional(Type.Boolean()),
   /**
    * Also claim `www.<hostname>` as a SECOND, fully independent domain row: its own
    * DNS record (returned in `records`), its own verification, its own certificate —

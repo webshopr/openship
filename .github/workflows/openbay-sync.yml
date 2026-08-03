@@ -1,0 +1,137 @@
+name: Openbay upstream sync
+
+# Keeps this fork current with oblien/openship.
+#
+# Merge, never rebase: a conflict resolved once stays resolved in history, and
+# the branch never needs a force-push. `.openbay/upstream.txt` records the tag
+# we're currently merged up to — the fork's own state, versioned with it.
+#
+# The run stops and opens an issue on ANY of: merge conflict, failed install,
+# failed patch assertions, failed typecheck. A merge that applies cleanly proves
+# nothing on its own — upstream can rename a helper or move a call site and
+# leave a patch inert, which is exactly what the assertions catch.
+on:
+  schedule:
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: openbay
+          fetch-depth: 0
+
+      - name: Find the next upstream release
+        id: check
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/oblien/openship.git
+          git fetch --tags upstream
+          current="$(tr -d '[:space:]' < .openbay/upstream.txt)"
+          # Newest stable tag (release candidates are skipped on purpose).
+          latest="$(git tag -l 'v*.*.*' --sort=-v:refname | grep -v -- '-rc' | head -1)"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          if [ "$current" = "$latest" ]; then
+            echo "todo=false" >> "$GITHUB_OUTPUT"
+            echo "Already on $current."
+          else
+            echo "todo=true" >> "$GITHUB_OUTPUT"
+            echo "$current → $latest"
+          fi
+
+      - name: Merge
+        id: merge
+        if: steps.check.outputs.todo == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "openbay-sync"
+          git config user.email "sync@openbay.dev"
+          if ! git merge --no-edit "${{ steps.check.outputs.latest }}"; then
+            {
+              echo "conflicts<<EOF"
+              git diff --name-only --diff-filter=U
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            git merge --abort
+            exit 1
+          fi
+          echo "${{ steps.check.outputs.latest }}" > .openbay/upstream.txt
+          git commit -am "chore: merge upstream ${{ steps.check.outputs.latest }}"
+
+      - uses: oven-sh/setup-bun@v2
+        if: steps.check.outputs.todo == 'true'
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install
+        if: steps.check.outputs.todo == 'true'
+        run: bun install
+
+      - name: Patch assertions
+        if: steps.check.outputs.todo == 'true'
+        run: |
+          bun run --cwd apps/api test -- src/lib/openbay-patches.test.ts
+          bun run --cwd apps/dashboard test -- src/lib/operator.test.ts
+
+      - name: Typecheck
+        if: steps.check.outputs.todo == 'true'
+        run: |
+          bun run --cwd apps/api lint
+          ./node_modules/.bin/tsc --noEmit -p apps/dashboard
+
+      - name: Push
+        if: steps.check.outputs.todo == 'true'
+        run: git push origin openbay
+
+      - name: Report a merge that needs a human
+        if: failure() && steps.check.outputs.todo == 'true'
+        uses: actions/github-script@v7
+        env:
+          LATEST: ${{ steps.check.outputs.latest }}
+          CURRENT: ${{ steps.check.outputs.current }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+        with:
+          script: |
+            const { LATEST, CURRENT, CONFLICTS } = process.env;
+            const conflicts = (CONFLICTS || "").trim();
+            const body = [
+              `Sync \`${CURRENT}\` → \`${LATEST}\` stopped and needs a hand.`,
+              "",
+              conflicts
+                ? `**Merge conflicts:**\n${conflicts.split("\n").map((f) => `- \`${f}\``).join("\n")}`
+                : "**The merge applied cleanly** — install, patch assertions or typecheck failed, so a patch may have gone inert. See the run log.",
+              "",
+              `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              "",
+              "Locally:",
+              "```",
+              "git fetch upstream --tags",
+              `git checkout openbay && git merge ${LATEST}`,
+              "# resolve, then:",
+              `echo ${LATEST} > .openbay/upstream.txt && git commit -a`,
+              "bun install && bun run --cwd apps/api test -- src/lib/openbay-patches.test.ts",
+              "```",
+            ].join("\n");
+            // The summary is written FIRST and unconditionally. Issues are a repo
+            // setting that can be off (they were, and a v0.5.0 sync reported nothing
+            // but a 410 in the log) — an alert must not depend on it.
+            await core.summary.addRaw(body).write();
+
+            const title = `Upstream sync ${LATEST} needs manual resolution`;
+            try {
+              const existing = await github.rest.issues.listForRepo({
+                ...context.repo, state: "open", labels: "upstream-sync",
+              });
+              if (existing.data.some((i) => i.title === title)) return;
+              await github.rest.issues.create({ ...context.repo, title, body, labels: ["upstream-sync"] });
+            } catch (err) {
+              core.warning(`Could not open the tracking issue (${err.status ?? "?"}): ${err.message}. Report is in the job summary.`);
+            }

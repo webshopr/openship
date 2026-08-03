@@ -26,6 +26,8 @@ import {
   tlsIssuedElsewhere,
 } from "../../lib/domain-ssl";
 import { getRoutingBaseDomain } from "../../lib/routing-domains";
+import { externalIngressPatch, resolveExternalIngress } from "../../lib/external-ingress";
+import { managedHostnameSuffix } from "../../lib/managed-hostname";
 import { resolveRecords } from "../../lib/dns-resolver";
 import { resolveProjectServerHost, resolveLocalServerHost, resolveInstancePublicIp, isLoopbackHost } from "../../lib/server-target";
 import { reconcileProjectRoutes } from "../../lib/route-apply.service";
@@ -122,7 +124,7 @@ export async function addDomain(
   // managed slug via the "add custom domain" flow and bypass the free-
   // domain slug picker.
   const baseDomain = getRoutingBaseDomain().toLowerCase();
-  if (hostname === baseDomain || hostname.endsWith(`.${baseDomain}`)) {
+  if (hostname === baseDomain || hostname.endsWith(managedHostnameSuffix(baseDomain))) {
     throw new ValidationError(
       `${baseDomain} subdomains are free managed domains — set them in the project's public endpoints, not as a custom domain.`,
     );
@@ -163,11 +165,12 @@ export async function addDomain(
     // still running), retrying must resume from the existing row instead of
     // trapping the user behind a same-project "already in use" conflict.
     const patch: Partial<Domain> = {};
-    if (
-      data.externalIngress !== undefined &&
-      existing.externalIngress !== data.externalIngress
-    ) {
-      patch.externalIngress = data.externalIngress;
+    const nextExternalIngress = externalIngressPatch(
+      existing.externalIngress ?? false,
+      data.externalIngress,
+    );
+    if (nextExternalIngress !== null) {
+      patch.externalIngress = nextExternalIngress;
     }
     // Only ever SET a redirect here; `redirectTo: undefined` (the common case —
     // a plain re-save) must not clear one the operator configured separately.
@@ -235,7 +238,10 @@ export async function addDomain(
     verified: false,
     status: "pending",
     isPrimary: data.isPrimary ?? false,
-    externalIngress: data.externalIngress ?? false,
+    // Behind an operator edge that owns port 80, certbot can never win the
+    // ACME challenge — an instance in that position imposes "external" instead
+    // of leaving every custom domain stuck pending.
+    externalIngress: resolveExternalIngress(data.externalIngress),
     verificationToken: token,
     redirectTo: redirect.redirectTo,
     redirectStatus: redirect.redirectStatus,

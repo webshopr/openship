@@ -36,6 +36,7 @@ import { relayConfigEligible, resolveClonePlan } from "./clone-plan";
 import { hasLocalGitIdentity } from "../github/github.local-auth";
 import { isPublicRepo } from "../github/github.http";
 import { getRoutingBaseDomain } from "../../lib/routing-domains";
+import { managedHostname } from "../../lib/managed-hostname";
 import { resolveServerHost } from "../../lib/server-target";
 import { normalizeTargetPath } from "../../lib/public-endpoints";
 import {
@@ -600,7 +601,7 @@ async function checkPublicEndpoints(
       id: idOf("slug"),
       label: `Endpoint subdomain (${label})`,
     });
-    const hostname = `${slug}.${baseDomain}`;
+    const hostname = managedHostname(slug, baseDomain);
     if (seenHostnames.has(hostname)) {
       checks.push(
         fail(idOf("domain"), `Endpoint domain (${label})`, `Duplicate domain configured: ${hostname}`),
@@ -628,7 +629,7 @@ async function checkPublicEndpoints(
       }
       // Redeploy reclaiming a subdomain this project already holds live is not
       // a conflict — skip the cloud availability probe entirely for it.
-      if (ownedLive.has(`${lk.slug}.${baseDomain}`.toLowerCase())) {
+      if (ownedLive.has(managedHostname(lk.slug, baseDomain).toLowerCase())) {
         return {
           id: `endpoint-${lk.index}-availability`,
           label: `Endpoint availability (${lk.label})`,
@@ -690,7 +691,7 @@ async function checkComposeServiceDomains(
       service.domain,
       serviceKind(service),
     );
-    const fqdn = `${subdomain}.${baseDomain}`;
+    const fqdn = managedHostname(subdomain, baseDomain);
 
     // Free subdomains require cloud - fail early if not connected
     if (!cloud) {
@@ -1038,7 +1039,7 @@ function checkSlugFormat(slug: string): PreflightCheck {
 }
 
 async function checkSlug(slug: string, cloud: CloudPreflightData | null): Promise<PreflightCheck> {
-  const fqdn = `${slug}.${getRoutingBaseDomain()}`;
+  const fqdn = managedHostname(slug, getRoutingBaseDomain());
 
   if (!cloud) {
     return { id: "slug-available", label: "Subdomain availability", status: "pass" };
@@ -1348,7 +1349,7 @@ export async function runPreflightChecks(
 
   if (!hasEndpointRouting && opts?.slug && !opts?.customDomain) {
     checks.push(checkSlugFormat(opts.slug));
-    const fqdn = `${opts.slug}.${getRoutingBaseDomain()}`.toLowerCase();
+    const fqdn = managedHostname(opts.slug, getRoutingBaseDomain()).toLowerCase();
     const ownedLive = await projectLiveHostnames(opts.projectId);
     if (ownedLive.has(fqdn)) {
       // Redeploy reclaiming its own subdomain — not a conflict.

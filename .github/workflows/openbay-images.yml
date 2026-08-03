@@ -1,0 +1,180 @@
+name: Openbay images
+
+# Builds this fork's images and publishes them to our own GHCR namespace.
+#
+# Deliberately separate from upstream's `docker-images.yml`, and triggered by a
+# DIFFERENT tag shape (`openbay-v*` instead of `v*.*.*`): upstream's workflow is
+# left byte-identical so it never conflicts on a merge, and it stays dormant
+# because we never push a tag matching its trigger.
+#
+# Tag convention: openbay-v0.4.8-1  →  images tagged 0.4.8-openbay.1
+on:
+  push:
+    tags:
+      - 'openbay-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag for a manual build (e.g. 0.4.8-openbay.test). Blank → short SHA."
+        required: false
+        type: string
+
+concurrency:
+  group: openbay-images-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  # Baked into the dashboard bundle at build time (NEXT_PUBLIC_* is inlined).
+  # Empty values would produce an unbranded image — that's the upstream default,
+  # not ours.
+  OPERATOR_NAME: Openbay
+  OPERATOR_URL: https://app.openbay.dev/instances
+  EXTERNAL_INGRESS_FORCED: "true"
+
+jobs:
+  # Assertions first: a patch that merged cleanly but no longer does anything
+  # must stop the release here, not surface as a failing certificate later.
+  verify-patches:
+    name: Verify fork patches
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+      - run: bun install
+      - name: API patch assertions
+        run: bun run --cwd apps/api test -- src/lib/openbay-patches.test.ts
+      - name: Dashboard patch assertions
+        run: bun run --cwd apps/dashboard test -- src/lib/operator.test.ts
+
+  resolve-tag:
+    name: Resolve image tag
+    needs: verify-patches
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - name: Derive the image tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # refs/tags/openbay-v0.4.8-1 → 0.4.8-openbay.1
+            raw="${GITHUB_REF#refs/tags/openbay-v}"
+            version="${raw%-*}-openbay.${raw##*-}"
+          elif [ -n "${{ github.event.inputs.tag }}" ]; then
+            version="${{ github.event.inputs.tag }}"
+          else
+            version="${GITHUB_SHA::7}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "→ $version"
+
+  build-images:
+    name: Build ${{ matrix.image }} (${{ matrix.platform }})
+    needs: resolve-tag
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [api, dashboard, edge]
+        platform: [amd64, arm64]
+        include:
+          - platform: amd64
+            runner: ubuntu-24.04
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Sans `image.source`, GHCR ne relie pas le package au dépôt : la page du
+      # package n'a aucun lien vers le code et sa visibilité ne se règle que dans
+      # ses propres paramètres.
+      - name: Image labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/openship-${{ matrix.image }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/${{ matrix.image }}/Dockerfile
+          platforms: linux/${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            OPERATOR_NAME=${{ env.OPERATOR_NAME }}
+            OPERATOR_URL=${{ env.OPERATOR_URL }}
+            EXTERNAL_INGRESS_FORCED=${{ env.EXTERNAL_INGRESS_FORCED }}
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/openship-${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=openbay-${{ matrix.image }}-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=openbay-${{ matrix.image }}-${{ matrix.platform }}
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.image }}-${{ matrix.platform }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-images:
+    name: Publish ${{ matrix.image }} (manifest)
+    needs: [resolve-tag, build-images]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [api, dashboard, edge]
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digests-${{ matrix.image }}-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # No `:latest` here, ever. The golden image pins an exact version, and a
+      # floating tag would let a rebuild change what a client's instance runs.
+      - name: Create manifest list + push
+        working-directory: /tmp/digests
+        env:
+          SRC: ghcr.io/${{ github.repository_owner }}/openship-${{ matrix.image }}
+          VERSION: ${{ needs.resolve-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create -t "${SRC}:${VERSION}" \
+            $(printf "${SRC}@sha256:%s " *)
+          docker buildx imagetools inspect "${SRC}:${VERSION}"

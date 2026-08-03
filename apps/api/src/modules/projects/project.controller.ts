@@ -2073,7 +2073,8 @@ export async function connectDomain(c: Context) {
       projectId: id,
       hostname: body.domain.trim(),
       isPrimary: true,
-      externalIngress: body.externalIngress ?? false,
+      // Left undefined on purpose: addDomain applies the instance default.
+      externalIngress: body.externalIngress,
       includeWww: body.includeWww ?? false,
     });
 
